@@ -7,6 +7,7 @@ require 'pp'
 require 'optparse'
 require 'open4'
 require 'fileutils'
+require 'logger'
 
 module AWS::S3
   class S3Object
@@ -25,6 +26,8 @@ end
 # Specifying more options
 #   $ brbackup --from=prod_br --databases=[bleacherreport, pa_stats] --restore
 #   $ brbackup --from=prod_ss --databases=[cmservice, a_b] --restore
+#
+#   $ brbackup --env=prod_ss --databases=[cmservice, a_b] --clone
 
 # list db
 # download db
@@ -35,6 +38,8 @@ module BR
     def self.register_as(name)
       BR::Backups::ENGINES[name] = self
     end
+    
+    attr_accessor :logger
 
     def initialize(backups)
       @backups = backups
@@ -50,6 +55,10 @@ module BR
 
     def dbpass
       @backups.config[:dbpass]
+    end
+    
+    def log(msg)
+      @logger.info(msg)
     end
   end
 
@@ -76,12 +85,21 @@ module BR
           options[:command] = :list
         end
         
+        opts.on("-n", "--names DB1,DB2,DB3", "Only restore these databases") do |n|
+          options[:databases] = n.split(',')
+        end
+        
         opts.on("-c", "--config CONFIG", "Use config file.") do |config|
           options[:config] = config
         end
         
         opts.on("-d", "--download BACKUP_INDEX", "download the backup specified by index. Run brbackup -l to get the index.") do |index|
           options[:command] = :download
+          options[:index] = index
+        end
+        
+        opts.on("--clone BACKUP_INDEX", "Clones database") do |index|
+          options[:command] = :clone
           options[:index] = index
         end
 
@@ -106,6 +124,8 @@ module BR
         brb.download(options[:index])
       when :restore
         brb.restore(options[:index])
+      when :clone
+        brb.clone(options[:index])
       end
     rescue SystemExit
       exit 1
@@ -118,8 +138,11 @@ module BR
     end
     
     def initialize(options)
+      @logger = Logger.new($stdout)
+
       engine_klass = ENGINES[options[:engine]] || raise("Invalid database engine: #{options[:engine].inspect}")
       @engine = engine_klass.new(self)
+      @engine.logger = @logger
 
       load_config(options[:config])
 
@@ -127,7 +150,7 @@ module BR
           :access_key_id     => config[:aws_secret_id],
           :secret_access_key => config[:aws_secret_key]
         )
-      @databases = config[:databases]
+      @databases = options[:databases] || config[:databases]
       @keep = config[:keep]
       @bucket = "ey-backup-#{Digest::SHA1.hexdigest(config[:aws_secret_id])[0..11]}"
       @tmpname = "#{Time.now.strftime("%Y-%m-%dT%H:%M:%S").gsub(/:/, '-')}.sql.gz"
@@ -148,6 +171,7 @@ module BR
       if File.exist?(filename)
         @config = YAML::load(File.read(filename))
       else
+        log "You need to have a backup file at #{filename}"
         $stderr.puts "You need to have a backup file at #{filename}"
         exit 1
       end
@@ -161,14 +185,14 @@ module BR
     
     def backup_database(database)
       File.open("#{self.backup_dir}/#{database}.#{@tmpname}", "w") do |f|
-        puts "doing database: #{database}"
+        log "doing database: #{database}"
         @engine.dump_database(database, f)
       end
 
       File.open("#{self.backup_dir}/#{database}.#{@tmpname}") do |f|
         path = "#{@env}.#{database}/#{database}.#{@tmpname}"
         AWS::S3::S3Object.store(path, f, @bucket, :access => :private)
-        puts "successful backup: #{database}.#{@tmpname}"
+        log "successful backup: #{database}.#{@tmpname}"
       end
     end
 
@@ -178,13 +202,13 @@ module BR
 
       if obj = list(db)[idx.to_i]
         filename = normalize_name(obj)
-        puts "downloading: #{filename}"
+        log "downloading: #{filename}"
         File.open(filename, 'wb') do |f|
           print "."
           obj.value {|chunk| f.write chunk }
         end
-        puts
-        puts "finished"
+        log ""
+        log "finished"
         [db, filename]
       else
         raise BackupNotFound, "No backup found for database #{db.inspect}: requested index: #{idx}"
@@ -193,15 +217,27 @@ module BR
     
     def restore(index)
       db, filename = download(index)
+      log "db #{db.inspect}"
+      log "filename #{filename.inspect}"
       File.open(filename) do |f|
         @engine.restore_database(db, f)
+      end
+    end
+    
+    def clone(index)
+      db, filename = download(index)
+      log "db #{db.inspect}"
+      log "filename #{filename.inspect}"
+      staging_name = filename.split('.')[0].gsub('_production', '_staging')
+      File.open(filename) do |f|
+        @engine.clone_database(staging_name, f)
       end
     end
     
     def cleanup
       begin
         list('all',false)[0...-(@keep*@databases.size)].each do |o| 
-          puts "deleting: #{o.key}"
+          log "deleting: #{o.key}"
           o.delete
         end
       rescue AWS::S3::S3Exception, AWS::S3::Error
@@ -218,20 +254,24 @@ module BR
     end
     
     def list(database='all', printer = false)
-      puts "Listing database backups for #{database}" if printer
+      log "@bucket #{@bucket.inspect}"
+      
+      log "Listing database backups for #{database}" if printer
       backups = []
       if database == 'all'
         @databases.each do |db|
+          log "prefix #{@env}.#{db}"
           backups << AWS::S3::Bucket.objects(@bucket, :prefix => "#{@env}.#{db}")
         end
         backups = backups.flatten.sort
       else
+        log "prefix2 #{@env}.#{database}"
         backups = AWS::S3::Bucket.objects(@bucket, :prefix => "#{@env}.#{database}").sort
       end
       if printer
-        puts "#{backups.size} backup(s) found"
+        log "#{backups.size} backup(s) found"
         backups.each_with_index do |b,i|
-          puts "#{i}:#{database} #{normalize_name(b)}"
+          log "#{i}:#{database} #{normalize_name(b)}"
         end
       end    
       backups
@@ -242,6 +282,9 @@ module BR
       "/mnt/tmp"
     end
     
+    def log(msg)
+      @logger.info(msg)
+    end
   end
   
   class MysqlDatabase < DatabaseEngine
@@ -258,11 +301,28 @@ module BR
     end
 
     def restore_database(name, io)
-      Open4.spawn ["gzip -dc | mysql -u#{dbuser} #{password_option} #{name}"], :stdin => io
+      log "mock restoring database..."
+      # Open4.spawn ["gzip -dc | mysql -u#{dbuser} #{password_option} #{name}"], :stdin => io
+    end
+    
+    def clone_database(staging_name, io)
+      log "dropping #{staging_name} database"
+      cmd = "mysql -u#{dbuser} #{password_option} -e 'drop database #{staging_name}'"
+      log "cmd #{cmd.inspect}"
+      Open4.popen4 cmd do |pid, stdin, stdout, stderr|
+        log stdout.read
+      end
+      log "creating #{staging_name} database"
+      Open4.popen4 "mysql -u#{dbuser} #{password_option} -e 'create database #{staging_name}'" do |pid, stdin, stdout, stderr|
+        log stdout.read
+      end
+      log "loading new dump "
+      Open4.spawn ["gzip -dc | mysql -u#{dbuser} #{password_option} #{staging_name}"], :stdin => io
     end
 
     def password_option
-      dbpass.blank? ? "" : "-p'#{dbpass}'"
+      dbpass.nil? || dbpass.blank? ? "" : "-p'#{dbpass}'"
     end
+    
   end
 end
