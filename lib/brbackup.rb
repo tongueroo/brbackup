@@ -236,6 +236,7 @@ module BR
     end
     
     def clone(db_name)
+      log "Clone of #{db_name} started!"
       index = most_recent_index(db_name)
       db, filename = download(index)
       log "db #{db.inspect}"
