@@ -19,20 +19,25 @@ end
 
 # Usage:
 # Simple:
-# restores bleacherreport_production and pa_stats_production from production to staging db
-#   $ brbackup --restore
+# restores bleacherreport_production from production to staging db
+#   $ brbackup -f prod_br --clone bleacherreport
 #
-# Advanced: 
+# More examples: 
 # Specifying more options
-#   $ brbackup --from=prod_br --databases=[bleacherreport, pa_stats] --restore
-#   $ brbackup --from=prod_ss --databases=[cmservice, a_b] --restore
+#   $ brbackup -f prod_ss --clone cmservice --logger /tmp/brbackup.log -c .mysql.backups.yml 
+#   $ brbackup -f prod_ss --clone cmservice --logger /tmp/brbackup.log -c .mysql.backups.yml 
 #
-#   $ brbackup --env=prod_ss --databases=[cmservice, a_b] --clone
-
-# list db
-# download db
-# restore db
-# test with pa_stats_production
+# Notes:
+# Format:
+# <bucket_name>/<env>.<db>/<filename>
+# Example : 
+# ey-backup-fe5a050b997d.s3.amazonaws.com/...
+#   prod_br.bleacherreport_production/bleacherreport_production.2010-03-07T09-10-01.sql.gz
+# 
+# The --clone option only needs the prefix of the database name because the amazon searches based
+# on the prefix of <env>.<db>
+# The filename of the dumpfile is then taken and then gsubed _production -> _staging
+# 
 module BR
   class DatabaseEngine
     def self.register_as(name)
@@ -85,9 +90,9 @@ module BR
           options[:command] = :list
         end
         
-        opts.on("-n", "--names DB1,DB2,DB3", "Only restore these databases") do |n|
-          options[:databases] = n.split(',')
-        end
+        # opts.on("-n", "--names DB1,DB2,DB3", "Only restore these databases") do |n|
+        #   options[:databases] = n.split(',')
+        # end
         
         opts.on("-c", "--config CONFIG", "Use config file.") do |config|
           options[:config] = config
@@ -98,9 +103,13 @@ module BR
           options[:index] = index
         end
         
-        opts.on("--clone BACKUP_INDEX", "Clones database") do |index|
+        opts.on("--clone DB_NAME", "Clones production database to staging") do |db_name|
           options[:command] = :clone
-          options[:index] = index
+          options[:db_name] = db_name
+        end
+
+        opts.on("--logger /path/to/logger", "Path to log path, default is stdout") do |logger|
+          options[:logger_path] = logger
         end
 
         opts.on("-r", "--restore BACKUP_INDEX", "Download and apply the backup specified by index WARNING! will overwrite the current db with the backup. Run brbackup -l to get the index.") do |index|
@@ -125,7 +134,7 @@ module BR
       when :restore
         brb.restore(options[:index])
       when :clone
-        brb.clone(options[:index])
+        brb.clone(options[:db_name])
       end
     rescue SystemExit
       exit 1
@@ -138,7 +147,11 @@ module BR
     end
     
     def initialize(options)
-      @logger = Logger.new($stdout)
+      if options[:logger_path]
+        @logger = Logger.new(options[:logger_path])
+      else
+        @logger = Logger.new($stdout)
+      end
 
       engine_klass = ENGINES[options[:engine]] || raise("Invalid database engine: #{options[:engine].inspect}")
       @engine = engine_klass.new(self)
@@ -217,14 +230,13 @@ module BR
     
     def restore(index)
       db, filename = download(index)
-      log "db #{db.inspect}"
-      log "filename #{filename.inspect}"
       File.open(filename) do |f|
         @engine.restore_database(db, f)
       end
     end
     
-    def clone(index)
+    def clone(db_name)
+      index = most_recent_index(db_name)
       db, filename = download(index)
       log "db #{db.inspect}"
       log "filename #{filename.inspect}"
@@ -254,27 +266,29 @@ module BR
     end
     
     def list(database='all', printer = false)
-      log "@bucket #{@bucket.inspect}"
-      
-      log "Listing database backups for #{database}" if printer
+      puts "Listing database backups for #{database}" if printer
       backups = []
       if database == 'all'
         @databases.each do |db|
-          log "prefix #{@env}.#{db}"
           backups << AWS::S3::Bucket.objects(@bucket, :prefix => "#{@env}.#{db}")
         end
         backups = backups.flatten.sort
       else
-        log "prefix2 #{@env}.#{database}"
         backups = AWS::S3::Bucket.objects(@bucket, :prefix => "#{@env}.#{database}").sort
       end
       if printer
-        log "#{backups.size} backup(s) found"
+        puts "#{backups.size} backup(s) found"
         backups.each_with_index do |b,i|
-          log "#{i}:#{database} #{normalize_name(b)}"
+          puts "#{i}:#{database} #{normalize_name(b)}"
         end
       end    
       backups
+    end
+    
+    # dirty way to get most recent index
+    def most_recent_index(db)
+      index = list(db).size - 1
+      "#{index}:#{db}"
     end
     
     protected
@@ -308,7 +322,6 @@ module BR
     def clone_database(staging_name, io)
       log "dropping #{staging_name} database"
       cmd = "mysql -u#{dbuser} #{password_option} -e 'drop database #{staging_name}'"
-      log "cmd #{cmd.inspect}"
       Open4.popen4 cmd do |pid, stdin, stdout, stderr|
         log stdout.read
       end
@@ -316,8 +329,9 @@ module BR
       Open4.popen4 "mysql -u#{dbuser} #{password_option} -e 'create database #{staging_name}'" do |pid, stdin, stdout, stderr|
         log stdout.read
       end
-      log "loading new dump "
+      log "loading new dump..."
       Open4.spawn ["gzip -dc | mysql -u#{dbuser} #{password_option} #{staging_name}"], :stdin => io
+      log "new dump loaded."
     end
 
     def password_option
