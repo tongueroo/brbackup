@@ -112,10 +112,10 @@ module BR
           options[:logger_path] = logger
         end
 
-        opts.on("-r", "--restore BACKUP_INDEX", "Download and apply the backup specified by index WARNING! will overwrite the current db with the backup. Run brbackup -l to get the index.") do |index|
-          options[:command] = :restore
-          options[:index] = index
-        end
+        # opts.on("-r", "--restore BACKUP_INDEX", "Download and apply the backup specified by index WARNING! will overwrite the current db with the backup. Run brbackup -l to get the index.") do |index|
+        #   options[:command] = :restore
+        #   options[:index] = index
+        # end
 
       end
 
@@ -131,8 +131,8 @@ module BR
         brb.list options[:db], true
       when :download
         brb.download(options[:index])
-      when :restore
-        brb.restore(options[:index])
+      # when :restore
+      #   brb.restore(options[:index])
       when :clone
         brb.clone(options[:db_name])
       end

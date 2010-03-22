@@ -7,6 +7,7 @@ GEM_SPEC = Gem::Specification.new do |s|
   s.homepage = "http://github.com/tongueroo/#{GEM_NAME}"
   s.summary = "brbackup summary"
   # == CONFIGURE ==
+  s.executables = ["brbackup"]
   s.add_dependency('builder', '>=2.1.2')
   s.extra_rdoc_files = [ "README.markdown" ]
   s.files = GEM_FILES.to_a
