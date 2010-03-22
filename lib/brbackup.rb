@@ -335,7 +335,7 @@ module BR
     end
 
     def password_option
-      dbpass.nil? || dbpass.blank? ? "" : "-p'#{dbpass}'"
+      dbpass.nil? || dbpass.empty? ? "" : "-p'#{dbpass}'"
     end
     
   end
